@@ -9,8 +9,15 @@ from constants import (
     STEREO_DEPTH_CONFIG
 )
 
+# ---- Tunables ----
+FALLBACK_BRIGHTNESS_MEAN = 40        # if mean(BGR) < this, push manual exposure
+MANUAL_EXPOSURE_US = 22000           # ~1/45s, adjust to your light
+MANUAL_ISO = 800                     # bump if still dark (but more noise)
+TARGET_FPS = 10                      # lower FPS => longer AE exposures in dim light
+STABILIZE_SECS = 2.0                 # let AE/AWB settle
+# -------------------
+
 def detect_camera(dai):
-    """Detect if OAK-D Lite camera is connected."""
     try:
         devices = dai.Device.getAllConnectedDevices()
         if not devices:
@@ -25,18 +32,35 @@ def detect_camera(dai):
         return None
 
 def create_camera_pipeline(dai):
-    """Create a pipeline for RGB and depth map capture."""
     try:
         pipeline = dai.Pipeline()
 
-        # RGB camera
+        # --- Color camera (use ISP output for proper tone mapping) ---
         rgb_cam = pipeline.create(dai.node.ColorCamera)
         rgb_cam.setBoardSocket(dai.CameraBoardSocket.CAM_A)
         rgb_cam.setResolution(getattr(dai.ColorCameraProperties.SensorResolution, CAMERA_RESOLUTION['rgb']))
         rgb_cam.setColorOrder(dai.ColorCameraProperties.ColorOrder.BGR)
         rgb_cam.setInterleaved(False)
+        rgb_cam.setFps(TARGET_FPS)
+        # If you want a specific output size, uncomment this:
+        # rgb_cam.setIspScale(1, 1)  # full ISP res from sensor
+        # rgb_cam.setVideoSize(1920, 1080)  # or use setPreviewSize
 
-        # Stereo mono cams
+        # 3A (auto-exposure/white-balance) initial controls
+        ctrl = dai.CameraControl()
+        ctrl.setAutoExposureEnable()  # let device drive exposure
+        ctrl.setAutoWhiteBalanceMode(dai.CameraControl.AutoWhiteBalanceMode.AUTO)
+        ctrl.setAntiBandingMode(dai.CameraControl.AntiBandingMode.AUTO)
+        # Small positive EV to brighten a bit
+        ctrl.setAutoExposureCompensation(+2)
+        rgb_cam.initialControl = ctrl
+
+        # Control input (so we can push a manual fallback later)
+        rgb_ctrl_in = pipeline.create(dai.node.XLinkIn)
+        rgb_ctrl_in.setStreamName("rgb_ctrl")
+        rgb_ctrl_in.out.link(rgb_cam.inputControl)
+
+        # --- Mono cams for stereo ---
         left_cam = pipeline.create(dai.node.MonoCamera)
         left_cam.setBoardSocket(dai.CameraBoardSocket.CAM_B)
         left_cam.setResolution(getattr(dai.MonoCameraProperties.SensorResolution, CAMERA_RESOLUTION['mono']))
@@ -45,43 +69,41 @@ def create_camera_pipeline(dai):
         right_cam.setBoardSocket(dai.CameraBoardSocket.CAM_C)
         right_cam.setResolution(getattr(dai.MonoCameraProperties.SensorResolution, CAMERA_RESOLUTION['mono']))
 
-        # Stereo depth
+        # --- Stereo depth ---
         stereo = pipeline.create(dai.node.StereoDepth)
         stereo.setDefaultProfilePreset(getattr(dai.node.StereoDepth.PresetMode, STEREO_DEPTH_CONFIG['preset']))
         stereo.setLeftRightCheck(STEREO_DEPTH_CONFIG['left_right_check'])
         stereo.setExtendedDisparity(STEREO_DEPTH_CONFIG['extended_disparity'])
         stereo.setSubpixel(STEREO_DEPTH_CONFIG['subpixel'])
+        stereo.setDepthAlign(dai.CameraBoardSocket.CAM_A)  # align to RGB
 
-        # Align depth to RGB viewpoint
-        stereo.setDepthAlign(dai.CameraBoardSocket.CAM_A)
-
-        # Outputs
+        # --- Outputs ---
         rgb_out = pipeline.create(dai.node.XLinkOut); rgb_out.setStreamName("rgb")
         depth_out = pipeline.create(dai.node.XLinkOut); depth_out.setStreamName("depth")
 
-        # Link
-        rgb_cam.video.link(rgb_out.input)
+        # Link ISP, not video (ISP gives properly processed frames)
+        rgb_cam.isp.link(rgb_out.input)
         left_cam.out.link(stereo.left)
         right_cam.out.link(stereo.right)
         stereo.depth.link(depth_out.input)
 
-        print("✓ Camera pipeline created successfully")
+        print("✓ Camera pipeline created successfully (ISP output, AE/AWB enabled)")
         return pipeline
     except Exception as e:
         print(f"✗ Failed to create pipeline: {e}")
         return None
 
 def capture_images(device, pipeline):
-    """Capture RGB and depth images from the camera."""
     try:
         print("Starting camera pipeline...")
         device.startPipeline(pipeline)
 
         rgb_queue = device.getOutputQueue(name="rgb", maxSize=4, blocking=False)
         depth_queue = device.getOutputQueue(name="depth", maxSize=4, blocking=False)
+        ctrl_queue = device.getInputQueue("rgb_ctrl")
 
-        print("Waiting for camera to stabilize.")
-        time.sleep(2)
+        print(f"Waiting {STABILIZE_SECS}s for AE/AWB to stabilize.")
+        time.sleep(STABILIZE_SECS)
 
         rgb_frame, depth_frame = None, None
         start_time = time.time(); timeout = 10
@@ -98,41 +120,53 @@ def capture_images(device, pipeline):
 
             if rgb_frame is not None and depth_frame is not None:
                 break
-            time.sleep(0.1)
+            time.sleep(0.05)
 
         if rgb_frame is None or depth_frame is None:
             print("✗ Failed to capture frames within timeout")
             return None, None
+
+        # Brightness check — if still too dark, push a manual exposure once
+        mean_brightness = float(rgb_frame.mean())
+        print(f"INFO: mean RGB brightness = {mean_brightness:.1f}")
+        if mean_brightness < FALLBACK_BRIGHTNESS_MEAN:
+            print("⚠️ Frame looks dark; pushing manual exposure fallback...")
+            manual = dai.CameraControl()
+            manual.setManualExposure(MANUAL_EXPOSURE_US, MANUAL_ISO)
+            manual.setAutoWhiteBalanceMode(dai.CameraControl.AutoWhiteBalanceMode.AUTO)
+            ctrl_queue.send(manual)
+            # give 3A a moment to apply and re-grab one more frame
+            time.sleep(0.3)
+            pkt = rgb_queue.get()  # blocking get a fresh frame
+            rgb_frame = pkt.getCvFrame()
+            print(f"✓ New mean brightness = {rgb_frame.mean():.1f}")
+
         return rgb_frame, depth_frame
     except Exception as e:
         print(f"✗ Error capturing images: {e}")
         return None, None
 
 def save_images(rgb_frame, depth_frame):
-    """Save captured images to disk."""
     try:
         timestamp = time.strftime("%Y%m%d_%H%M%S")
 
-        # Save RGB
-        cv2.imwrite(RGB_IMAGE_PATH, rgb_frame)
+        # Save RGB (BGR 8-bit)
+        ok_rgb = cv2.imwrite(RGB_IMAGE_PATH, rgb_frame)
+        if not ok_rgb:
+            raise RuntimeError("Failed to write RGB PNG")
         print(f"✓ RGB image saved: {RGB_IMAGE_PATH}")
 
-        # Save RAW 16-bit depth to DEPTH_MAP_PATH (no normalization!)
+        # Save RAW 16-bit depth (no normalization)
         ok = cv2.imwrite(DEPTH_MAP_PATH, depth_frame)
         if not ok:
             raise RuntimeError("Failed to write 16-bit depth PNG")
         print(f"✓ 16-bit depth saved: {DEPTH_MAP_PATH}")
 
-        # Also save a preview for debugging (8-bit)
+        # Optional preview for debugging (8-bit)
         depth_preview = cv2.normalize(depth_frame, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
         preview_path = f"depth_preview_{timestamp}.png"
         cv2.imwrite(preview_path, depth_preview)
         print(f"✓ Depth preview saved: {preview_path}")
-
-        # Optional: raw .npy snapshot for debugging
-        raw_npy = f"depth_raw_{timestamp}.npy"
-        np.save(raw_npy, depth_frame)
-        print(f"✓ Raw depth snapshot saved: {raw_npy}")
         return True
     except Exception as e:
         print(f"✗ Error saving images: {e}")
